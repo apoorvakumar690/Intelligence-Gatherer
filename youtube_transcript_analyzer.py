@@ -66,7 +66,9 @@ import yt_dlp
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 OPENROUTER_BASE_URL   = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL         = "anthropic/claude-3.5-sonnet"
+DEFAULT_ANALYSE_MODEL = "google/gemini-2.5-flash"
+DEFAULT_REPORT_MODEL  = "anthropic/claude-sonnet-4.6"
+DEFAULT_MODEL         = DEFAULT_ANALYSE_MODEL  # legacy --model flag default
 TRANSCRIPT_CHAR_LIMIT = 90_000   # ~22k tokens
 MAX_SCREENSHOTS       = 8
 
@@ -101,6 +103,82 @@ STOPWORDS = {
     "\u0905\u0917\u0930","\u091c\u0948\u0938\u0947","\u0907\u0938\u0932\u093f\u090f",
     "\u092a\u0930\u0902\u0924\u0941","\u0915\u094d\u092f\u094b\u0902\u0915\u093f",
 }
+
+SANGRAHAK_SYSTEM_PROMPT = """You are an intelligent market analyst and explainer.
+
+Your job is NOT to summarize content.
+Your job is to help the reader UNDERSTAND what's really going on.
+
+Adopt the writing style of "Markets by Zerodha — Daily Brief".
+
+## CORE PRINCIPLES (MANDATORY)
+
+1. Do NOT start with raw facts or data.
+   Always start with an observation, tension, or curiosity.
+
+2. Focus on:
+   - Why things are happening
+   - How things work (mechanism)
+   - Why it matters
+
+3. Avoid:
+   - Jargon (or explain it instantly)
+   - Corporate tone
+   - Sensationalism
+   - Empty summaries
+
+4. Write like:
+   A smart operator explaining something over coffee.
+
+Tone:
+- Calm
+- Curious
+- Slightly opinionated
+- Clear, not flashy
+
+## WRITING STRUCTURE (STRICT)
+
+For each major topic or section, follow this structure:
+
+1. HOOK
+   Start with a curiosity-driven line.
+
+2. CONTEXT
+   What happened (brief, no overload)
+
+3. MECHANISM
+   Explain step-by-step WHY it happened (A → B → C causal chain)
+
+4. INSIGHT
+   What's the deeper story here? What are people missing?
+
+5. IMPLICATION
+   Why should the reader care?
+
+## WRITING STYLE RULES
+
+- Use short paragraphs (2-4 lines max)
+- One idea per paragraph
+- Use analogies where helpful: "Think of it like..."
+- Prefer simple language over technical precision
+- Add subtle opinions: "This might not be as important as it sounds..."
+
+## ANTI-PATTERNS (STRICTLY AVOID)
+
+- "In this video, the speaker discusses..."
+- Bullet-point summaries without explanation
+- Long paragraphs
+- Data-first explanations
+- Generic conclusions
+
+## FINAL CHECK BEFORE OUTPUT
+
+Ask yourself:
+- Does this feel like a story or a report?
+- Did I explain WHY, not just WHAT?
+- Would a smart non-expert understand this easily?
+
+If not, rewrite."""
 
 
 # ─── URL / ID helpers ──────────────────────────────────────────────────────────
@@ -198,11 +276,11 @@ def fetch_video_metadata(url: str) -> dict:
 
 # ─── OpenRouter helpers ────────────────────────────────────────────────────────
 
-def _llm(client: OpenAI, prompt: str, system: str = "", model: str = DEFAULT_MODEL) -> str:
+def _llm(client: OpenAI, prompt: str, system: str = "", model: str = DEFAULT_MODEL, max_tokens: int = 4096) -> str:
     """Send a chat completion request via OpenRouter."""
     resp = client.chat.completions.create(
         model=model,
-        max_tokens=4096,
+        max_tokens=max_tokens,
         messages=[
             {"role": "system", "content": system or "You are a senior research analyst. Be precise and concise."},
             {"role": "user",   "content": prompt},
@@ -244,7 +322,7 @@ Respond with ONE word only: informative OR interview"""
 
 # ─── Step 2a: Informative analysis ────────────────────────────────────────────
 
-def analyze_informative(client: OpenAI, timestamped_transcript: str, metadata: dict, model: str) -> dict:
+def analyze_informative(client: OpenAI, timestamped_transcript: str, metadata: dict, model: str, instructions: str = "") -> dict:
     trimmed, was_trimmed = trim_transcript(timestamped_transcript)
     note = " (transcript was trimmed due to length)" if was_trimmed else ""
 
@@ -275,7 +353,13 @@ Return a single JSON object - no markdown, no explanation, raw JSON only:
     }}
   ],
   "important_facts": ["Fact 1", "Fact 2"],
-  "takeaways": ["Takeaway 1", "Takeaway 2"]
+  "takeaways": ["Takeaway 1", "Takeaway 2"],
+  "visual_cues": [
+    {{
+      "timestamp": "HH:MM:SS",
+      "description": "What visual is being referenced (e.g. 'chart showing 59% demand increase')"
+    }}
+  ]
 }}
 
 Rules:
@@ -283,7 +367,11 @@ Rules:
 - key_insights: 5-8 entries, timestamps must exist in the transcript
 - important_facts: 5-8 notable data points or facts
 - takeaways: 4-6 actionable or memorable points
+- visual_cues: 3-6 entries — timestamps where speaker says "as you can see", "this chart/graph shows", "here's the data", "looking at this", or references a statistic likely displayed on screen. Timestamps must exist in transcript.
 - Return ONLY valid JSON"""
+
+    if instructions:
+        prompt += f"\n\nAdditional instructions: {instructions}"
 
     raw = _llm(client, prompt, model=model)
     return _parse_json(raw)
@@ -291,7 +379,7 @@ Rules:
 
 # ─── Step 2b: Interview analysis ──────────────────────────────────────────────
 
-def analyze_interview(client: OpenAI, timestamped_transcript: str, metadata: dict, model: str) -> dict:
+def analyze_interview(client: OpenAI, timestamped_transcript: str, metadata: dict, model: str, instructions: str = "") -> dict:
     trimmed, was_trimmed = trim_transcript(timestamped_transcript)
     note = " (transcript was trimmed due to length)" if was_trimmed else ""
 
@@ -329,7 +417,13 @@ Return a single JSON object - no markdown, no explanation, raw JSON only:
       "timestamp": "HH:MM:SS"
     }}
   ],
-  "takeaways": ["Takeaway 1", "Takeaway 2"]
+  "takeaways": ["Takeaway 1", "Takeaway 2"],
+  "visual_cues": [
+    {{
+      "timestamp": "HH:MM:SS",
+      "description": "What visual is being referenced (e.g. 'chart showing 59% demand increase')"
+    }}
+  ]
 }}
 
 Rules:
@@ -337,10 +431,111 @@ Rules:
 - notable_quotes: 4-6 impactful quotes
 - key_insights: 5-8 entries
 - All timestamps must exist in the transcript
+- visual_cues: 3-6 entries — timestamps where speaker says "as you can see", "this chart/graph shows", "here's the data", "looking at this", or references a statistic likely displayed on screen. Timestamps must exist in transcript.
 - Return ONLY valid JSON"""
+
+    if instructions:
+        prompt += f"\n\nAdditional instructions: {instructions}"
 
     raw = _llm(client, prompt, model=model)
     return _parse_json(raw)
+
+
+# ─── Step 2c: Sangrahak styled report ─────────────────────────────────────────
+
+def generate_sangrahak_report(
+    client: OpenAI,
+    analysis: dict,
+    metadata: dict,
+    video_url: str,
+    lang: str,
+    video_type: str,
+    output_dir: Path,
+    model: str,
+    report_instructions: str = "",
+) -> str:
+    """Generate a Zerodha-style narrative markdown report from structured analysis JSON."""
+
+    deep_dive_instruction = (
+        "For each key_topic"
+        if video_type == "informative"
+        else "For each main_theme (drawing on qa_pairs and key_insights for detail)"
+    )
+
+    prompt = f"""Video: {metadata['title']}
+Channel: {metadata['channel']}
+Type: {video_type}
+Language: {lang}
+URL: {video_url}
+Duration: {seconds_to_hms(metadata['duration'])}
+
+STRUCTURED ANALYSIS (JSON) — use this as your source of truth, do not invent facts:
+{json.dumps(analysis, indent=2, ensure_ascii=False)}
+
+Generate a Zerodha-style markdown report using the analysis above.
+
+OUTPUT FORMAT (follow exactly):
+
+### 1. Title
+One insight-driven headline (NOT just the video title)
+
+### 2. Metadata table
+| Field | Value |
+|-------|-------|
+rows for Channel, Language, Duration, URL, Analyzed
+
+### 3. Summary
+3-5 bullet points — high-signal takeaways only
+
+---
+
+### 4. Deep Dive Sections
+{deep_dive_instruction}, write one section:
+- Section heading = topic/theme name
+- Follow: Hook → Context → Mechanism → Insight → Implication (each as its own short paragraph)
+
+---
+
+### 5. Key Takeaways
+4-6 bullet points — actionable or mental-model level insights
+
+---
+
+### 6. Word Cloud
+![Word Cloud](wordcloud.png)
+
+Output only the markdown. No preamble, no explanation."""
+
+    if report_instructions:
+        prompt += f"\n\nAdditional report instructions: {report_instructions}"
+
+    styled_md = _llm(client, prompt, system=SANGRAHAK_SYSTEM_PROMPT, model=model, max_tokens=8192)
+
+    # Ensure word cloud is present at the end if the LLM omitted it
+    if "wordcloud.png" not in styled_md:
+        styled_md += "\n\n---\n\n## Word Cloud\n\n![Word Cloud](wordcloud.png)\n"
+
+    # Post-process: inject screenshot images after their matching timestamp markers
+    items_with_shots = (
+        analysis.get("key_insights", []) + analysis.get("key_topics", [])
+        if video_type == "informative"
+        else analysis.get("qa_pairs", []) + analysis.get("key_insights", [])
+    )
+    for item in items_with_shots:
+        if "screenshot" not in item:
+            continue
+        try:
+            rel = Path(item["screenshot"]).relative_to(output_dir)
+        except ValueError:
+            rel = item["screenshot"]
+        ts = item.get("timestamp", "")
+        if ts and ts in styled_md:
+            # Insert the image right after the first occurrence of the timestamp
+            styled_md = styled_md.replace(ts, f"{ts}\n\n![Screenshot]({rel})", 1)
+
+    report_path = output_dir / "report.md"
+    report_path.write_text(styled_md, encoding="utf-8")
+    return str(report_path)
 
 
 # ─── Step 3: Screenshots ──────────────────────────────────────────────────────
@@ -354,25 +549,40 @@ def _ffmpeg_available() -> bool:
 
 
 def _get_stream_url(youtube_url: str) -> str:
-    """Return the best direct video stream URL (no download)."""
+    """Return a video-only stream URL suitable for screenshot seeking."""
+    # Video-only (no audio track): ffmpeg only needs to fetch video segments
+    # when seeking, which is much faster than muxed streams for mid-video seeks.
     opts = {
-        "format":      "best[ext=mp4]/bestvideo[ext=mp4]/best",
+        "format":      "worstvideo[height>=240][ext=mp4]/worstvideo[height>=240]/worstvideo[ext=mp4]/worstvideo",
         "quiet":       True,
         "no_warnings": True,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(youtube_url, download=False)
 
+    # Single-stream result
     if "url" in info:
         return info["url"]
 
-    for fmt in sorted(
-        info.get("formats", []),
-        key=lambda f: f.get("height", 0) or 0,
-        reverse=True,
-    ):
-        if fmt.get("ext") == "mp4" and fmt.get("vcodec") not in (None, "none"):
-            return fmt["url"]
+    # Pick video-only stream: no audio codec, has a video codec
+    candidates = [
+        f for f in info.get("formats", [])
+        if f.get("vcodec") not in (None, "none")
+        and f.get("acodec") in (None, "none")
+        and f.get("url")
+    ]
+    if candidates:
+        candidates.sort(key=lambda f: f.get("height", 0) or 0)
+        return candidates[0]["url"]
+
+    # Fallback: any format with a video track
+    candidates = [
+        f for f in info.get("formats", [])
+        if f.get("vcodec") not in (None, "none") and f.get("url")
+    ]
+    if candidates:
+        candidates.sort(key=lambda f: f.get("height", 0) or 0)
+        return candidates[0]["url"]
 
     raise RuntimeError("Could not obtain a direct video stream URL.")
 
@@ -380,14 +590,65 @@ def _get_stream_url(youtube_url: str) -> str:
 def _take_single_screenshot(stream_url: str, hms: str, out_path: str) -> bool:
     """Use ffmpeg to grab one frame at timestamp hms. Returns True on success."""
     cmd = [
-        "ffmpeg", "-ss", hms, "-i", stream_url,
-        "-vframes", "1", "-q:v", "2", "-y", out_path,
+        "ffmpeg",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-ss", hms,
+        "-i", stream_url,
+        "-an",           # no audio — video-only stream, skip audio decoding
+        "-vframes", "1",
+        "-q:v", "2",
+        "-y", out_path,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=90)
+        result = subprocess.run(cmd, capture_output=True, timeout=45)
         return result.returncode == 0 and Path(out_path).exists()
     except subprocess.TimeoutExpired:
         return False
+
+
+def _hms_to_sec(hms: str) -> float:
+    h, m, s = hms.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+def _detect_scene_changes(stream_url: str, center_hms: str, window_sec: int = 30) -> list[str]:
+    """Detect scene-change timestamps within a window around center_hms.
+    Returns HH:MM:SS strings sorted closest-first to center."""
+    def sec_to_hms(s):
+        s = max(0.0, s)
+        h, m = int(s//3600), int((s%3600)//60)
+        return f"{h:02d}:{m:02d}:{s%60:06.3f}"
+
+    center_sec = _hms_to_sec(center_hms)
+    start_sec  = max(0.0, center_sec - window_sec / 2)
+    cmd = [
+        "ffmpeg", "-reconnect", "1", "-reconnect_streamed", "1",
+        "-ss", sec_to_hms(start_sec), "-t", str(window_sec),
+        "-i", stream_url, "-an",
+        "-vf", "select='gt(scene,0.3)',showinfo",
+        "-vsync", "vfr", "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=60, text=True)
+    except subprocess.TimeoutExpired:
+        return []
+    times = []
+    for line in result.stderr.splitlines():
+        m = re.search(r"pts_time:([\d.]+)", line)
+        if m:
+            times.append(start_sec + float(m.group(1)))
+    times.sort(key=lambda s: abs(s - center_sec))
+    return [sec_to_hms(s) for s in times]
+
+
+def _snap_to_scene(stream_url: str, target_hms: str, out_path: str) -> bool:
+    """Take screenshot at nearest scene change to target_hms, fallback to target."""
+    for ts in _detect_scene_changes(stream_url, target_hms)[:3]:
+        if _take_single_screenshot(stream_url, ts, out_path):
+            return True
+    return _take_single_screenshot(stream_url, target_hms, out_path)
 
 
 def take_screenshots(
@@ -395,9 +656,11 @@ def take_screenshots(
     items: list[dict],
     output_dir: Path,
     max_shots: int = MAX_SCREENSHOTS,
+    visual_cues: list[dict] | None = None,
 ) -> list[dict]:
     """
     For each item with a 'timestamp' key, take a screenshot.
+    visual_cues items are prioritised; scene-change snapping is used for each shot.
     Returns items with an added 'screenshot' key (path) on success.
     """
     if not _ffmpeg_available():
@@ -416,27 +679,44 @@ def take_screenshots(
     shots_dir = output_dir / "screenshots"
     shots_dir.mkdir(exist_ok=True)
 
-    enriched = []
-    taken    = 0
-    for idx, item in enumerate(items):
-        ts = item.get("timestamp", "")
-        if not ts or taken >= max_shots:
-            enriched.append(item)
+    # visual_cues first; remaining items fill the quota
+    cue_set    = {c.get("timestamp") for c in (visual_cues or [])}
+    candidates = list(visual_cues or []) + [i for i in items if i.get("timestamp") not in cue_set]
+
+    # Build index to attach screenshots back onto original items
+    ts_to_idx = {item.get("timestamp"): idx for idx, item in enumerate(items) if item.get("timestamp")}
+    enriched  = list(items)
+
+    taken = 0
+    for shot_num, cand in enumerate(candidates):
+        if taken >= max_shots:
+            break
+        ts = cand.get("timestamp", "")
+        if not ts:
             continue
-
-        fname = f"shot_{idx+1:02d}_{ts.replace(':', '-')}.jpg"
+        fname = f"shot_{shot_num+1:02d}_{ts.replace(':', '-')}.jpg"
         fpath = shots_dir / fname
-
         print(f"  [screenshot] @ {ts} ...", end=" ", flush=True)
-        ok = _take_single_screenshot(stream_url, ts, str(fpath))
-        if ok:
+        if _snap_to_scene(stream_url, ts, str(fpath)):
             print("OK")
-            item = {**item, "screenshot": str(fpath)}
             taken += 1
+            if ts in ts_to_idx:
+                idx = ts_to_idx[ts]
+                enriched[idx] = {**enriched[idx], "screenshot": str(fpath)}
+            elif items:
+                # visual_cue timestamp — attach to nearest item by time
+                try:
+                    cue_sec = _hms_to_sec(ts)
+                    nearest = min(
+                        range(len(enriched)),
+                        key=lambda i: abs(_hms_to_sec(enriched[i].get("timestamp", "00:00:00")) - cue_sec)
+                    )
+                    if "screenshot" not in enriched[nearest]:
+                        enriched[nearest] = {**enriched[nearest], "screenshot": str(fpath)}
+                except Exception:
+                    pass
         else:
             print("FAILED")
-
-        enriched.append(item)
 
     print(f"  {taken} screenshot(s) saved -> {shots_dir}")
     return enriched
@@ -444,7 +724,18 @@ def take_screenshots(
 
 # ─── Step 4: Word cloud ────────────────────────────────────────────────────────
 
-def generate_wordcloud(plain_text: str, output_path: str) -> str:
+def generate_wordcloud(plain_text: str, output_path: str, font_path: str | None = None) -> str:
+    # Auto-detect a Hindi-capable font if none provided
+    if font_path is None:
+        candidates = [
+            "/mnt/c/Windows/Fonts/NotoSansDevanagari-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+            str(Path(__file__).parent / "NotoSansDevanagari-Regular.ttf"),
+        ]
+        for c in candidates:
+            if Path(c).exists():
+                font_path = c
+                break
     wc = WordCloud(
         width=1400,
         height=700,
@@ -454,6 +745,7 @@ def generate_wordcloud(plain_text: str, output_path: str) -> str:
         colormap="viridis",
         collocations=True,
         prefer_horizontal=0.85,
+        font_path=font_path,
     )
     wc.generate(plain_text)
 
@@ -636,8 +928,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
-        help=f"Model to use via OpenRouter (default: {DEFAULT_MODEL})",
+        default=DEFAULT_ANALYSE_MODEL,
+        help=f"Model for classify + analyse steps (default: {DEFAULT_ANALYSE_MODEL})",
+    )
+    parser.add_argument(
+        "--report-model",
+        default=DEFAULT_REPORT_MODEL,
+        help=f"Model for report generation (default: {DEFAULT_REPORT_MODEL})",
     )
     parser.add_argument(
         "--output-dir",
@@ -655,7 +952,46 @@ def main() -> None:
         default=MAX_SCREENSHOTS,
         help=f"Max screenshots to capture (default: {MAX_SCREENSHOTS})",
     )
+    parser.add_argument(
+        "--instructions",
+        default="",
+        metavar="TEXT",
+        help="Extra extraction instructions for the analyse step "
+             "(e.g. \"extract all stock tickers mentioned\")",
+    )
+    parser.add_argument(
+        "--instructions-file",
+        default="",
+        metavar="PATH",
+        help="Path to a text file with analyse-step instructions (merged with --instructions)",
+    )
+    parser.add_argument(
+        "--report-instructions",
+        default="",
+        metavar="TEXT",
+        help="Extra instructions for the Sangrahak report generation step",
+    )
+    parser.add_argument(
+        "--report-instructions-file",
+        default="",
+        metavar="PATH",
+        help="Path to a text file with report-step instructions (merged with --report-instructions)",
+    )
     args = parser.parse_args()
+
+    def _load_instructions(inline: str, fpath: str) -> str:
+        parts = []
+        if fpath:
+            try:
+                parts.append(Path(fpath).read_text(encoding="utf-8").strip())
+            except OSError as e:
+                sys.exit(f"ERROR: Cannot read instructions file '{fpath}': {e}")
+        if inline:
+            parts.append(inline.strip())
+        return "\n\n".join(parts)
+
+    analyse_instructions = _load_instructions(args.instructions, args.instructions_file)
+    report_instructions  = _load_instructions(args.report_instructions, args.report_instructions_file)
 
     if not args.api_key:
         sys.exit(
@@ -672,7 +1008,8 @@ def main() -> None:
     SEP = "-" * 62
     print(f"\n{SEP}")
     print("  YouTube Transcript Analyzer")
-    print(f"  Model: {args.model}")
+    print(f"  Analyse model : {args.model}")
+    print(f"  Report model  : {args.report_model}")
     print(SEP)
 
     # ── 1. Video metadata ────────────────────────────────────────
@@ -683,87 +1020,126 @@ def main() -> None:
     print(f"      Channel : {metadata['channel']}")
     print(f"      Duration: {seconds_to_hms(metadata['duration'])}")
 
-    # ── 2. Transcript ────────────────────────────────────────────
-    print("\n[2/7] Fetching transcript ...")
-    segments, lang = fetch_transcript(video_id)
-    plain_text       = " ".join((s.text if hasattr(s, "text") else s["text"]) for s in segments)
-    timestamped_text = segments_to_timestamped_text(segments)
-    print(f"      Language: {lang}  |  Segments: {len(segments)}  |  "
-          f"Chars: {len(plain_text):,}")
-
-    # ── 3. Output directory ──────────────────────────────────────
-    # Sanitise title for use as a folder name
+    # ── 3. Output directory (needed before transcript check) ─────
     safe_title = re.sub(r'[\\/:*?"<>|]', '', metadata['title']).strip()
-    safe_title = re.sub(r'\s+', ' ', safe_title)[:100]  # cap length
+    safe_title = re.sub(r'\s+', ' ', safe_title)[:100]
     folder_name = safe_title or video_id
     out_dir = Path(args.output_dir) / folder_name
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n[3/7] Output -> {out_dir.resolve()}")
 
     transcript_file = out_dir / "transcript.txt"
-    transcript_file.write_text(timestamped_text, encoding="utf-8")
-    print(f"      transcript.txt saved ({len(timestamped_text):,} chars)")
+    metadata_file   = out_dir / "metadata.json"
+    analysis_file   = out_dir / "analysis.json"
 
-    # ── 4. Classify ──────────────────────────────────────────────
-    print("\n[4/7] Classifying video type ...")
-    video_type = classify_video(client, metadata, timestamped_text, args.model)
-    print(f"      -> {video_type.upper()}")
-
-    # ── 5. Analyse ───────────────────────────────────────────────
-    print("\n[5/7] Analysing transcript ...")
-    if video_type == "informative":
-        analysis = analyze_informative(client, timestamped_text, metadata, args.model)
-        print(f"      Topics: {len(analysis.get('key_topics', []))}  |  "
-              f"Insights: {len(analysis.get('key_insights', []))}")
+    # ── 2. Transcript ────────────────────────────────────────────
+    if transcript_file.exists():
+        print("\n[2/7] Transcript cached — loading from file ...")
+        timestamped_text = transcript_file.read_text(encoding="utf-8")
+        plain_text = " ".join(
+            line.split("] ", 1)[1]
+            for line in timestamped_text.splitlines()
+            if "] " in line
+        )
+        cached_meta = json.loads(metadata_file.read_text(encoding="utf-8")) if metadata_file.exists() else {}
+        lang = cached_meta.get("lang", "en")
+        print(f"      {len(timestamped_text):,} chars  |  lang: {lang}")
     else:
-        analysis = analyze_interview(client, timestamped_text, metadata, args.model)
-        print(f"      Q&A pairs: {len(analysis.get('qa_pairs', []))}  |  "
-              f"Insights: {len(analysis.get('key_insights', []))}")
+        print("\n[2/7] Fetching transcript ...")
+        segments, lang = fetch_transcript(video_id)
+        plain_text       = " ".join((s.text if hasattr(s, "text") else s["text"]) for s in segments)
+        timestamped_text = segments_to_timestamped_text(segments)
+        print(f"      Language: {lang}  |  Segments: {len(segments)}  |  "
+              f"Chars: {len(plain_text):,}")
+        transcript_file.write_text(timestamped_text, encoding="utf-8")
+        print(f"      transcript.txt saved")
+        metadata_file.write_text(
+            json.dumps({**metadata, "lang": lang}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
-    (out_dir / "analysis.json").write_text(
-        json.dumps(analysis, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    # ── 4+5. Classify + Analyse ──────────────────────────────────
+    if analysis_file.exists():
+        print("\n[4/7] Classify skipped — analysis.json cached.")
+        print("\n[5/7] Analyse skipped — analysis.json cached.")
+        analysis   = json.loads(analysis_file.read_text(encoding="utf-8"))
+        video_type = analysis.get("video_type", "informative")
+        print(f"      -> {video_type.upper()} (from cache)")
+    else:
+        print("\n[4/7] Classifying video type ...")
+        video_type = classify_video(client, metadata, timestamped_text, args.model)
+        print(f"      -> {video_type.upper()}")
+
+        print("\n[5/7] Analysing transcript ...")
+        if video_type == "informative":
+            analysis = analyze_informative(client, timestamped_text, metadata, args.model, analyse_instructions)
+            print(f"      Topics: {len(analysis.get('key_topics', []))}  |  "
+                  f"Insights: {len(analysis.get('key_insights', []))}")
+        else:
+            analysis = analyze_interview(client, timestamped_text, metadata, args.model, analyse_instructions)
+            print(f"      Q&A pairs: {len(analysis.get('qa_pairs', []))}  |  "
+                  f"Insights: {len(analysis.get('key_insights', []))}")
+
+        analysis["video_type"] = video_type
+        analysis_file.write_text(
+            json.dumps(analysis, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
 
     # ── 6. Screenshots ───────────────────────────────────────────
+    shots_dir      = out_dir / "screenshots"
+    existing_shots = list(shots_dir.glob("*.jpg")) if shots_dir.exists() else []
     if args.no_screenshots:
         print("\n[6/7] Screenshots skipped (--no-screenshots).")
+    elif existing_shots:
+        print(f"\n[6/7] Screenshots cached — {len(existing_shots)} already exist, skipping.")
     else:
         print("\n[6/7] Taking screenshots at key timestamps ...")
-        max_shots = args.max_screenshots
+        max_shots   = args.max_screenshots
+        visual_cues = analysis.get("visual_cues", [])
         if video_type == "informative":
             analysis["key_insights"] = take_screenshots(
-                args.url, analysis.get("key_insights", []), out_dir, max_shots
+                args.url, analysis.get("key_insights", []), out_dir, max_shots,
+                visual_cues=visual_cues,
             )
-            already = sum(1 for i in analysis["key_insights"] if "screenshot" in i)
+            already   = sum(1 for i in analysis["key_insights"] if "screenshot" in i)
             remaining = max(0, max_shots - already)
             if remaining:
                 analysis["key_topics"] = take_screenshots(
-                    args.url, analysis.get("key_topics", []), out_dir, remaining
+                    args.url, analysis.get("key_topics", []), out_dir, remaining,
                 )
         else:
             analysis["qa_pairs"] = take_screenshots(
-                args.url, analysis.get("qa_pairs", []), out_dir, max_shots
+                args.url, analysis.get("qa_pairs", []), out_dir, max_shots,
+                visual_cues=visual_cues,
             )
-            already = sum(1 for q in analysis["qa_pairs"] if "screenshot" in q)
+            already   = sum(1 for q in analysis["qa_pairs"] if "screenshot" in q)
             remaining = max(0, max_shots - already)
             if remaining:
                 analysis["key_insights"] = take_screenshots(
-                    args.url, analysis.get("key_insights", []), out_dir, remaining
+                    args.url, analysis.get("key_insights", []), out_dir, remaining,
                 )
 
     # ── 7. Word cloud ────────────────────────────────────────────
-    print("\n[7/7] Generating word cloud ...", end=" ", flush=True)
-    wc_path = str(out_dir / "wordcloud.png")
-    generate_wordcloud(plain_text, wc_path)
-    print(f"saved -> {wc_path}")
+    wc_path = out_dir / "wordcloud.png"
+    if wc_path.exists():
+        print(f"\n[7/7] Word cloud cached — skipping.")
+    else:
+        print("\n[7/7] Generating word cloud ...", end=" ", flush=True)
+        generate_wordcloud(plain_text, str(wc_path))
+        print(f"saved -> {wc_path}")
 
     # ── Report ───────────────────────────────────────────────────
-    print("      Building report ...", end=" ", flush=True)
-    if video_type == "informative":
-        report_path = build_report_informative(analysis, metadata, out_dir, lang, args.url)
+    report_file = out_dir / "report.md"
+    if report_file.exists():
+        print("      Report cached — skipping.")
+        report_path = str(report_file)
     else:
-        report_path = build_report_interview(analysis, metadata, out_dir, lang, args.url)
-    print(f"saved -> {report_path}")
+        print("      Generating Sangrahak report ...", end=" ", flush=True)
+        report_path = generate_sangrahak_report(
+            client, analysis, metadata, args.url, lang, video_type, out_dir, args.report_model,
+            report_instructions=report_instructions,
+        )
+        print(f"saved -> {report_path}")
 
     # ── Summary ──────────────────────────────────────────────────
     print(f"\n{SEP}")
