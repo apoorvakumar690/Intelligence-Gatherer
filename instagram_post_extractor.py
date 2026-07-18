@@ -188,17 +188,19 @@ def run_ocr(media_dir: Path, lang: str) -> list[dict]:
     return results
 
 
-def run_vision_ocr(media_dir: Path, api_key: str, model: str) -> list[dict]:
+def run_vision_ocr(media_dir: Path, api_key: str, model: str, parent_span=None) -> list[dict]:
     if not api_key:
         raise SystemExit(
             "ERROR: --vision-ocr requires an OpenRouter API key.\n"
             "Set OPENROUTER_API_KEY or pass --api-key <key>."
         )
 
-    _ensure_package("openai", "openai")
-    from openai import OpenAI
-
-    client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=api_key)
+    import tracer
+    client = tracer.get_openai_client(
+        api_key=api_key,
+        base_url=OPENROUTER_BASE_URL,
+        span_obj=parent_span
+    )
     results = []
 
     for image_path in image_files(media_dir):
@@ -560,119 +562,145 @@ def main() -> None:
     args = parser.parse_args()
 
     shortcode = extract_shortcode(args.url)
-    out_dir = Path(args.output_dir) / shortcode
-    media_dir = out_dir / "media"
-    slides_dir = out_dir / "slides"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    media_dir.mkdir(exist_ok=True)
-    slides_dir.mkdir(exist_ok=True)
+    import tracer
 
-    print("\nInstagram Post Extractor")
-    print(f"  Shortcode : {shortcode}")
-    print(f"  Output    : {out_dir.resolve()}")
+    with tracer.trace(
+        name="instagram_extractor",
+        input_data={
+            "url": args.url,
+            "vision_ocr": args.vision_ocr,
+            "ocr": args.ocr,
+        },
+        metadata={
+            "shortcode": shortcode,
+        }
+    ) as run_trace:
+        out_dir = Path(args.output_dir) / shortcode
+        media_dir = out_dir / "media"
+        slides_dir = out_dir / "slides"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        media_dir.mkdir(exist_ok=True)
+        slides_dir.mkdir(exist_ok=True)
 
-    loader = instaloader.Instaloader(
-        dirname_pattern=str(media_dir),
-        download_pictures=True,
-        download_videos=not args.no_videos,
-        download_video_thumbnails=True,
-        download_geotags=False,
-        download_comments=args.comments,
-        save_metadata=False,
-        compress_json=False,
-        quiet=False,
-    )
+        print("\nInstagram Post Extractor")
+        print(f"  Shortcode : {shortcode}")
+        print(f"  Output    : {out_dir.resolve()}")
 
-    configure_login(loader, args.login, args.session_file, args.password_env)
-
-    print("\n[1/4] Fetching post metadata ...")
-    try:
-        post = instaloader.Post.from_shortcode(loader.context, shortcode)
-    except instaloader.exceptions.LoginRequiredException as exc:
-        raise SystemExit(
-            "ERROR: Instagram requires login for this post.\n"
-            "Try: python instagram_post_extractor.py <url> --login <your_username>"
-        ) from exc
-    except instaloader.exceptions.ConnectionException as exc:
-        raise SystemExit(f"ERROR: Could not fetch Instagram post: {exc}") from exc
-
-    metadata = post_to_metadata(post, args.url)
-    print(f"      Account : @{metadata['owner_username']}")
-    print(f"      Type    : {metadata['typename']}")
-    print(f"      Media   : {metadata['media_count']}")
-
-    print("\n[2/4] Downloading media ...")
-    loader.download_post(post, target=str(media_dir))
-    media_files = sorted(
-        path
-        for path in media_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".mp4"}
-    )
-    print(f"      Saved {len(media_files)} media file(s)")
-
-    print("\n[3/4] Writing text files ...")
-    (out_dir / "caption.txt").write_text(metadata["caption"], encoding="utf-8")
-    (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
-    print("      caption.txt")
-    print("      metadata.json")
-
-    ocr_results: list[dict] = []
-    if args.ocr and args.vision_ocr:
-        raise SystemExit("ERROR: Use either --ocr or --vision-ocr, not both.")
-
-    if args.vision_ocr:
-        print("\n[4/4] Running vision OCR ...")
-        ocr_results = run_vision_ocr(media_dir, args.api_key, args.vision_model)
-        if ocr_results:
-            (out_dir / "ocr.json").write_text(json.dumps(ocr_results, indent=2, ensure_ascii=False), encoding="utf-8")
-            ocr_text = "\n\n".join(
-                f"## {item['file']}\n\n{item.get('text', '')}".strip()
-                for item in ocr_results
-            )
-            (out_dir / "ocr_text.txt").write_text(ocr_text, encoding="utf-8")
-            write_slide_text(slides_dir, ocr_results)
-            print("      ocr.json")
-            print("      ocr_text.txt")
-            print("      slides/slide_text.md")
-    elif args.ocr:
-        print("\n[4/4] Running OCR ...")
-        ocr_results = run_ocr(media_dir, args.ocr_lang)
-        if ocr_results:
-            (out_dir / "ocr.json").write_text(json.dumps(ocr_results, indent=2, ensure_ascii=False), encoding="utf-8")
-            ocr_text = "\n\n".join(
-                f"## {item['file']}\n\n{item.get('text', '')}".strip()
-                for item in ocr_results
-            )
-            (out_dir / "ocr_text.txt").write_text(ocr_text, encoding="utf-8")
-            write_slide_text(slides_dir, ocr_results)
-            print("      ocr.json")
-            print("      ocr_text.txt")
-            print("      slides/slide_text.md")
-    else:
-        print("\n[4/4] OCR skipped (use --ocr to extract text embedded inside images).")
-
-    crop_results: list[dict] = []
-    if args.crop_pictures:
-        print("\n[extra] Cropping embedded pictures ...")
-        crop_results = crop_slide_pictures(
-            media_dir,
-            slides_dir,
-            manual_crop_box=args.manual_crop,
-            min_area_ratio=args.min_crop_area,
+        loader = instaloader.Instaloader(
+            dirname_pattern=str(media_dir),
+            download_pictures=True,
+            download_videos=not args.no_videos,
+            download_video_thumbnails=True,
+            download_geotags=False,
+            download_comments=args.comments,
+            save_metadata=False,
+            compress_json=False,
+            quiet=False,
         )
-        (out_dir / "picture_crops.json").write_text(
-            json.dumps(crop_results, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        count = sum(len(item["crops"]) for item in crop_results)
-        print(f"      Saved {count} crop(s) -> {slides_dir / 'crops'}")
-        print("      picture_crops.json")
 
-    report_path = write_report(out_dir, metadata, media_files, ocr_results, crop_results)
+        configure_login(loader, args.login, args.session_file, args.password_env)
 
-    print("\nDONE")
-    print(f"  Output folder : {out_dir.resolve()}")
-    print(f"  Report        : {report_path}")
+        print("\n[1/4] Fetching post metadata ...")
+        with tracer.span(run_trace, "metadata_fetch") as step_span:
+            try:
+                post = instaloader.Post.from_shortcode(loader.context, shortcode)
+            except instaloader.exceptions.LoginRequiredException as exc:
+                raise SystemExit(
+                    "ERROR: Instagram requires login for this post.\n"
+                    "Try: python instagram_post_extractor.py <url> --login <your_username>"
+                ) from exc
+            except instaloader.exceptions.ConnectionException as exc:
+                raise SystemExit(f"ERROR: Could not fetch Instagram post: {exc}") from exc
+
+            metadata = post_to_metadata(post, args.url)
+            step_span.update(output=metadata)
+
+        print(f"      Account : @{metadata['owner_username']}")
+        print(f"      Type    : {metadata['typename']}")
+        print(f"      Media   : {metadata['media_count']}")
+
+        print("\n[2/4] Downloading media ...")
+        with tracer.span(run_trace, "download_media") as step_span:
+            loader.download_post(post, target=str(media_dir))
+            media_files = sorted(
+                path
+                for path in media_dir.iterdir()
+                if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".mp4"}
+            )
+            step_span.update(output={"files_count": len(media_files)})
+        print(f"      Saved {len(media_files)} media file(s)")
+
+        print("\n[3/4] Writing text files ...")
+        with tracer.span(run_trace, "write_text_files"):
+            (out_dir / "caption.txt").write_text(metadata["caption"], encoding="utf-8")
+            (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+        print("      caption.txt")
+        print("      metadata.json")
+
+        ocr_results: list[dict] = []
+        if args.ocr and args.vision_ocr:
+            raise SystemExit("ERROR: Use either --ocr or --vision-ocr, not both.")
+
+        if args.vision_ocr:
+            print("\n[4/4] Running vision OCR ...")
+            with tracer.span(run_trace, "vision_ocr") as step_span:
+                ocr_results = run_vision_ocr(media_dir, args.api_key, args.vision_model, parent_span=step_span)
+                if ocr_results:
+                    (out_dir / "ocr.json").write_text(json.dumps(ocr_results, indent=2, ensure_ascii=False), encoding="utf-8")
+                    ocr_text = "\n\n".join(
+                        f"## {item['file']}\n\n{item.get('text', '')}".strip()
+                        for item in ocr_results
+                    )
+                    (out_dir / "ocr_text.txt").write_text(ocr_text, encoding="utf-8")
+                    write_slide_text(slides_dir, ocr_results)
+                    print("      ocr.json")
+                    print("      ocr_text.txt")
+                    print("      slides/slide_text.md")
+                step_span.update(output={"ocr_slides_count": len(ocr_results)})
+        elif args.ocr:
+            print("\n[4/4] Running OCR ...")
+            with tracer.span(run_trace, "local_ocr") as step_span:
+                ocr_results = run_ocr(media_dir, args.ocr_lang)
+                if ocr_results:
+                    (out_dir / "ocr.json").write_text(json.dumps(ocr_results, indent=2, ensure_ascii=False), encoding="utf-8")
+                    ocr_text = "\n\n".join(
+                        f"## {item['file']}\n\n{item.get('text', '')}".strip()
+                        for item in ocr_results
+                    )
+                    (out_dir / "ocr_text.txt").write_text(ocr_text, encoding="utf-8")
+                    write_slide_text(slides_dir, ocr_results)
+                    print("      ocr.json")
+                    print("      ocr_text.txt")
+                    print("      slides/slide_text.md")
+                step_span.update(output={"ocr_slides_count": len(ocr_results)})
+        else:
+            print("\n[4/4] OCR skipped (use --ocr to extract text embedded inside images).")
+
+        crop_results: list[dict] = []
+        if args.crop_pictures:
+            print("\n[extra] Cropping embedded pictures ...")
+            with tracer.span(run_trace, "crop_pictures") as step_span:
+                crop_results = crop_slide_pictures(
+                    media_dir,
+                    slides_dir,
+                    manual_crop_box=args.manual_crop,
+                    min_area_ratio=args.min_crop_area,
+                )
+                (out_dir / "picture_crops.json").write_text(
+                    json.dumps(crop_results, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                count = sum(len(item["crops"]) for item in crop_results)
+                print(f"      Saved {count} crop(s) -> {slides_dir / 'crops'}")
+                print("      picture_crops.json")
+                step_span.update(output={"crops_count": count})
+
+        with tracer.span(run_trace, "generate_report"):
+            report_path = write_report(out_dir, metadata, media_files, ocr_results, crop_results)
+
+        print("\nDONE")
+        print(f"  Output folder : {out_dir.resolve()}")
+        print(f"  Report        : {report_path}")
 
 
 if __name__ == "__main__":

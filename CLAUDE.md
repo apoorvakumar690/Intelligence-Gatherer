@@ -1,6 +1,6 @@
 # Sangrahak — संग्राहक
 
-Research utility toolkit. Currently: YouTube transcript analyser.
+Research utility toolkit. YouTube transcript analyser + OKF knowledge base.
 
 ## Commands
 
@@ -28,6 +28,13 @@ python youtube_transcript_analyzer.py <url> \
   --instructions-file prompts/analyse.txt \
   --report-instructions-file prompts/report.txt
 
+# Hindi video — auto-translates via Sarvam when SARVAM_API_KEY is set
+export SARVAM_API_KEY="your-sarvam-key"
+python youtube_transcript_analyzer.py <hindi-url>
+
+# Skip Sarvam translation even for Hindi videos
+python youtube_transcript_analyzer.py <hindi-url> --no-translate
+
 # Install deps manually
 pip install -r requirements.txt
 ```
@@ -44,6 +51,7 @@ Single-file tool: `youtube_transcript_analyzer.py`
 ## Environment
 
 - `OPENROUTER_API_KEY` — required (get from openrouter.ai/keys)
+- `SARVAM_API_KEY` — optional; enables Hindi → English translation via Sarvam Mayura before LLM analysis
 - Default model: `anthropic/claude-3.5-sonnet`
 - Transcript capped at 90,000 chars (~22k tokens)
 
@@ -62,6 +70,45 @@ The LLM prompt instructs output in the style of "Markets by Zerodha — Daily Br
 - Calm, curious, slightly opinionated tone
 - Short paragraphs, explain WHY not just WHAT
 - No bullet-point summaries, no corporate tone
+
+## OKF Knowledge Base (`okf_manager.py`)
+
+```bash
+# Init a shared bundle
+python okf_manager.py init knowledge/
+
+# List all concept docs
+python okf_manager.py list knowledge/
+
+# Search across bundle
+python okf_manager.py search knowledge/ "interest rates"
+
+# Manually add a concept
+python okf_manager.py add knowledge/ --type insight --title "My note" --resource <url> --tags "finance,india"
+
+# Export a YouTube analysis into the bundle
+python okf_manager.py export-youtube output/<video>/analysis.json knowledge/
+
+# Auto-export during analysis (set once, forget)
+export OKF_BUNDLE="knowledge/"
+python youtube_transcript_analyzer.py <url>
+
+# Or pass per-run
+python youtube_transcript_analyzer.py <url> --okf-bundle knowledge/
+```
+
+Bundle layout:
+```
+knowledge/
+  index.md          -- bundle root
+  log.md            -- auto change-log
+  youtube/
+    <video-slug>/
+      index.md      -- video concept (type: video)
+      topic-*.md    -- one per key_topic  (type: topic)
+      insight-*.md  -- one per insight    (type: insight)
+      qa-*.md       -- one per Q&A pair   (type: qa, interview only)
+```
 
 ## Planned Modules
 

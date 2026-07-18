@@ -41,15 +41,19 @@ _DEPS = {
     "matplotlib":             "matplotlib",
     "yt_dlp":                 "yt-dlp",
     "PIL":                    "Pillow",
+    "dotenv":                 "python-dotenv",
 }
 
-_missing = [pkg for mod, pkg in _DEPS.items() if not __import__("importlib").util.find_spec(mod)]
+_missing = [pkg for mod, pkg in _DEPS.items() if not __import__("importlib.util").util.find_spec(mod)]
 if _missing:
     print(f"Installing missing packages: {', '.join(_missing)} ...")
     _pip_install(*_missing)
 
 
 # ─── Imports (after auto-install) ─────────────────────────────────────────────
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
@@ -71,6 +75,10 @@ DEFAULT_REPORT_MODEL  = "anthropic/claude-sonnet-4.6"
 DEFAULT_MODEL         = DEFAULT_ANALYSE_MODEL  # legacy --model flag default
 TRANSCRIPT_CHAR_LIMIT = 90_000   # ~22k tokens
 MAX_SCREENSHOTS       = 8
+
+SARVAM_API_URL     = "https://api.sarvam.ai/translate"
+SARVAM_CHUNK_CHARS = 950   # Sarvam translate limit ~1000 chars/request
+HINDI_LANG_CODES   = {"hi", "hi-IN", "hi-in"}
 
 STOPWORDS = {
     # English filler
@@ -237,15 +245,47 @@ def fetch_transcript(video_id: str) -> tuple[list, str]:
     raise RuntimeError("No transcript found for this video.")
 
 
-def segments_to_timestamped_text(segments) -> str:
-    lines = []
+def segments_to_timestamped_text(segments, block_duration_sec=30) -> str:
+    """
+    Merges transcript segments into logical paragraphs (The Paragraph Method).
+    Drops a timestamp only at the start of a time block or after natural sentence boundaries.
+    """
+    paragraphs = []
+    current_paragraph = []
+    current_start_time = None
+    
     for seg in segments:
         # v1.x returns FetchedTranscriptSnippet dataclass objects
         start = seg.start if hasattr(seg, "start") else seg["start"]
         text  = seg.text  if hasattr(seg, "text")  else seg["text"]
-        ts = seconds_to_hms(start)
-        lines.append(f"[{ts}] {text.strip()}")
-    return "\n".join(lines)
+        
+        # Set the timestamp for the beginning of the new block
+        if current_start_time is None:
+            current_start_time = start
+            
+        current_paragraph.append(text.strip())
+        
+        # Check if we've reached the time limit AND a natural sentence end
+        is_end_of_sentence = text.strip().endswith(('.', '?', '!', '।')) # Includes Hindi Purna Viram
+        is_time_up = (start - current_start_time) >= block_duration_sec
+        # Force a split if the block duration exceeds 3x block_duration_sec (e.g. 90 seconds)
+        # to prevent extremely long/unbroken paragraphs in transcripts without punctuation.
+        is_force_split = (start - current_start_time) >= (block_duration_sec * 3)
+        
+        if is_force_split or (is_time_up and is_end_of_sentence):
+            ts = seconds_to_hms(current_start_time)
+            paragraphs.append(f"[{ts}] {' '.join(current_paragraph)}")
+            
+            # Reset for the next paragraph
+            current_paragraph = []
+            current_start_time = None
+            
+    # Catch any remaining text at the end of the video
+    if current_paragraph:
+        ts = seconds_to_hms(current_start_time) if current_start_time is not None else "00:00:00"
+        paragraphs.append(f"[{ts}] {' '.join(current_paragraph)}")
+        
+    return "\n\n".join(paragraphs)
 
 
 def trim_transcript(text: str, limit: int = TRANSCRIPT_CHAR_LIMIT) -> tuple[str, bool]:
@@ -256,6 +296,145 @@ def trim_transcript(text: str, limit: int = TRANSCRIPT_CHAR_LIMIT) -> tuple[str,
     tail = int(limit * 0.40)
     trimmed = text[:head] + "\n\n[... transcript trimmed for length ...]\n\n" + text[-tail:]
     return trimmed, True
+
+
+# ─── Sarvam translation ───────────────────────────────────────────────────────
+
+def prepare_timestamped_text_for_translation(timestamped_text: str, max_chars: int = 950) -> str:
+    """
+    Ensures no line in the timestamped text exceeds max_chars.
+    If a line is too long, it splits the content by sentences/words and prefixes
+    each part with the same timestamp.
+    """
+    lines = timestamped_text.splitlines()
+    new_lines = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            new_lines.append("")
+            continue
+            
+        # Match timestamp prefix at start, e.g. [00:01:23]
+        match = re.match(r'^(\[\d{2}:\d{2}:\d{2}\])\s*(.*)', line)
+        if not match:
+            prefix = ""
+            content = line
+        else:
+            prefix = match.group(1) + " "
+            content = match.group(2)
+            
+        if len(line) <= max_chars:
+            new_lines.append(line)
+            continue
+            
+        # Line is too long, split content into sentences
+        sentences = re.split(r'([.?!।]\s*)', content)
+        parts = []
+        i = 0
+        while i < len(sentences):
+            part_text = sentences[i]
+            part_punct = sentences[i+1] if i+1 < len(sentences) else ""
+            part = part_text + part_punct
+            if part.strip():
+                parts.append(part.strip())
+            i += 2
+            
+        current_part_group = []
+        current_part_len = len(prefix)
+        
+        for part in parts:
+            if len(prefix) + len(part) + 1 > max_chars:
+                if current_part_group:
+                    new_lines.append(f"{prefix}{' '.join(current_part_group)}")
+                    current_part_group = []
+                    current_part_len = len(prefix)
+                
+                # Split sentence by space
+                words = part.split(' ')
+                for word in words:
+                    if current_part_len + len(word) + 1 <= max_chars:
+                        current_part_group.append(word)
+                        current_part_len += len(word) + 1
+                    else:
+                        if current_part_group:
+                            new_lines.append(f"{prefix}{' '.join(current_part_group)}")
+                        current_part_group = [word]
+                        current_part_len = len(prefix) + len(word)
+            else:
+                if current_part_len + len(part) + 1 <= max_chars:
+                    current_part_group.append(part)
+                    current_part_len += len(part) + 1
+                else:
+                    if current_part_group:
+                        new_lines.append(f"{prefix}{' '.join(current_part_group)}")
+                    current_part_group = [part]
+                    current_part_len = len(prefix) + len(part)
+                    
+        if current_part_group:
+            new_lines.append(f"{prefix}{' '.join(current_part_group)}")
+            
+    return "\n".join(new_lines)
+
+
+def translate_transcript_sarvam(timestamped_text: str, api_key: str) -> str:
+    """Translate Hindi timestamped transcript → English via Sarvam Mayura API.
+
+    Chunks the transcript into ≤ SARVAM_CHUNK_CHARS slices (split on line
+    boundaries), translates each, and reassembles in order.  The [HH:MM:SS]
+    timestamp prefixes are ASCII and are preserved by the API.
+    """
+    import urllib.request as _ureq
+    import urllib.error  as _uerr
+
+    # Pre-process text to ensure no paragraph/line exceeds the chunk character limit
+    timestamped_text = prepare_timestamped_text_for_translation(timestamped_text, SARVAM_CHUNK_CHARS)
+    lines = timestamped_text.splitlines()
+
+    # Group lines into character-capped chunks
+    chunks: list[str] = []
+    buf: list[str]    = []
+    buf_len           = 0
+    for line in lines:
+        if buf and buf_len + len(line) + 1 > SARVAM_CHUNK_CHARS:
+            chunks.append("\n".join(buf))
+            buf, buf_len = [], 0
+        buf.append(line)
+        buf_len += len(line) + 1
+    if buf:
+        chunks.append("\n".join(buf))
+
+    translated: list[str] = []
+    for i, chunk in enumerate(chunks, 1):
+        print(f"    chunk {i}/{len(chunks)} ...", end=" ", flush=True)
+        payload = json.dumps({
+            "input":                chunk,
+            "source_language_code": "hi-IN",
+            "target_language_code": "en-IN",
+            "speaker_gender":       "Male",
+            "mode":                 "formal",
+            "model":                "mayura:v1",
+            "enable_preprocessing": False,
+        }).encode("utf-8")
+        req = _ureq.Request(
+            SARVAM_API_URL,
+            data=payload,
+            headers={
+                "api-subscription-key": api_key,
+                "Content-Type":         "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with _ureq.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except _uerr.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Sarvam API HTTP {exc.code}: {body}") from exc
+        translated.append(data["translated_text"])
+        print("OK")
+
+    return "\n".join(translated)
 
 
 # ─── Video metadata via yt-dlp ─────────────────────────────────────────────────
@@ -977,6 +1156,23 @@ def main() -> None:
         metavar="PATH",
         help="Path to a text file with report-step instructions (merged with --report-instructions)",
     )
+    parser.add_argument(
+        "--sarvam-key",
+        default=os.environ.get("SARVAM_API_KEY", ""),
+        help="Sarvam API key for Hindi → English translation (default: $SARVAM_API_KEY)",
+    )
+    parser.add_argument(
+        "--no-translate",
+        action="store_true",
+        help="Skip Sarvam translation even when transcript is Hindi",
+    )
+    parser.add_argument(
+        "--okf-bundle",
+        default=os.environ.get("OKF_BUNDLE", ""),
+        metavar="PATH",
+        help="Path to shared OKF knowledge bundle (default: $OKF_BUNDLE). "
+             "Auto-exports analysis after report generation.",
+    )
     args = parser.parse_args()
 
     def _load_instructions(inline: str, fpath: str) -> str:
@@ -1000,164 +1196,240 @@ def main() -> None:
             "  Get a key at: https://openrouter.ai/keys"
         )
 
-    client = OpenAI(
-        base_url=OPENROUTER_BASE_URL,
-        api_key=args.api_key,
-    )
+    import tracer
 
-    SEP = "-" * 62
-    print(f"\n{SEP}")
-    print("  YouTube Transcript Analyzer")
-    print(f"  Analyse model : {args.model}")
-    print(f"  Report model  : {args.report_model}")
-    print(SEP)
-
-    # ── 1. Video metadata ────────────────────────────────────────
-    print("\n[1/7] Fetching video metadata ...")
-    video_id = extract_video_id(args.url)
-    metadata = fetch_video_metadata(args.url)
-    print(f"      Title   : {metadata['title']}")
-    print(f"      Channel : {metadata['channel']}")
-    print(f"      Duration: {seconds_to_hms(metadata['duration'])}")
-
-    # ── 3. Output directory (needed before transcript check) ─────
-    safe_title = re.sub(r'[\\/:*?"<>|]', '', metadata['title']).strip()
-    safe_title = re.sub(r'\s+', ' ', safe_title)[:100]
-    folder_name = safe_title or video_id
-    out_dir = Path(args.output_dir) / folder_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\n[3/7] Output -> {out_dir.resolve()}")
-
-    transcript_file = out_dir / "transcript.txt"
-    metadata_file   = out_dir / "metadata.json"
-    analysis_file   = out_dir / "analysis.json"
-
-    # ── 2. Transcript ────────────────────────────────────────────
-    if transcript_file.exists():
-        print("\n[2/7] Transcript cached — loading from file ...")
-        timestamped_text = transcript_file.read_text(encoding="utf-8")
-        plain_text = " ".join(
-            line.split("] ", 1)[1]
-            for line in timestamped_text.splitlines()
-            if "] " in line
-        )
-        cached_meta = json.loads(metadata_file.read_text(encoding="utf-8")) if metadata_file.exists() else {}
-        lang = cached_meta.get("lang", "en")
-        print(f"      {len(timestamped_text):,} chars  |  lang: {lang}")
-    else:
-        print("\n[2/7] Fetching transcript ...")
-        segments, lang = fetch_transcript(video_id)
-        plain_text       = " ".join((s.text if hasattr(s, "text") else s["text"]) for s in segments)
-        timestamped_text = segments_to_timestamped_text(segments)
-        print(f"      Language: {lang}  |  Segments: {len(segments)}  |  "
-              f"Chars: {len(plain_text):,}")
-        transcript_file.write_text(timestamped_text, encoding="utf-8")
-        print(f"      transcript.txt saved")
-        metadata_file.write_text(
-            json.dumps({**metadata, "lang": lang}, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+    with tracer.trace(
+        name="youtube_analyzer",
+        input_data={
+            "url": args.url,
+            "model": args.model,
+            "report_model": args.report_model,
+        },
+        metadata={
+            "url": args.url,
+        }
+    ) as run_trace:
+        client = tracer.get_openai_client(
+            api_key=args.api_key,
+            base_url=OPENROUTER_BASE_URL,
+            trace_obj=run_trace,
         )
 
-    # ── 4+5. Classify + Analyse ──────────────────────────────────
-    if analysis_file.exists():
-        print("\n[4/7] Classify skipped — analysis.json cached.")
-        print("\n[5/7] Analyse skipped — analysis.json cached.")
-        analysis   = json.loads(analysis_file.read_text(encoding="utf-8"))
-        video_type = analysis.get("video_type", "informative")
-        print(f"      -> {video_type.upper()} (from cache)")
-    else:
-        print("\n[4/7] Classifying video type ...")
-        video_type = classify_video(client, metadata, timestamped_text, args.model)
-        print(f"      -> {video_type.upper()}")
+        SEP = "-" * 62
+        print(f"\n{SEP}")
+        print("  YouTube Transcript Analyzer")
+        print(f"  Analyse model : {args.model}")
+        print(f"  Report model  : {args.report_model}")
+        print(SEP)
 
-        print("\n[5/7] Analysing transcript ...")
-        if video_type == "informative":
-            analysis = analyze_informative(client, timestamped_text, metadata, args.model, analyse_instructions)
-            print(f"      Topics: {len(analysis.get('key_topics', []))}  |  "
-                  f"Insights: {len(analysis.get('key_insights', []))}")
-        else:
-            analysis = analyze_interview(client, timestamped_text, metadata, args.model, analyse_instructions)
-            print(f"      Q&A pairs: {len(analysis.get('qa_pairs', []))}  |  "
-                  f"Insights: {len(analysis.get('key_insights', []))}")
+        # ── 1. Video metadata ────────────────────────────────────────
+        print("\n[1/7] Fetching video metadata ...")
+        with tracer.span(run_trace, "metadata_fetch") as step_span:
+            video_id = extract_video_id(args.url)
+            metadata = fetch_video_metadata(args.url)
+            step_span.update(output=metadata)
+        print(f"      Title   : {metadata['title']}")
+        print(f"      Channel : {metadata['channel']}")
+        print(f"      Duration: {seconds_to_hms(metadata['duration'])}")
 
-        analysis["video_type"] = video_type
-        analysis_file.write_text(
-            json.dumps(analysis, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        # ── 3. Output directory (needed before transcript check) ─────
+        safe_title = re.sub(r'[\\/:*?"<>|]', '', metadata['title']).strip()
+        safe_title = re.sub(r'\s+', ' ', safe_title)[:100]
+        folder_name = safe_title or video_id
+        out_dir = Path(args.output_dir) / folder_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n[3/7] Output -> {out_dir.resolve()}")
 
-    # ── 6. Screenshots ───────────────────────────────────────────
-    shots_dir      = out_dir / "screenshots"
-    existing_shots = list(shots_dir.glob("*.jpg")) if shots_dir.exists() else []
-    if args.no_screenshots:
-        print("\n[6/7] Screenshots skipped (--no-screenshots).")
-    elif existing_shots:
-        print(f"\n[6/7] Screenshots cached — {len(existing_shots)} already exist, skipping.")
-    else:
-        print("\n[6/7] Taking screenshots at key timestamps ...")
-        max_shots   = args.max_screenshots
-        visual_cues = analysis.get("visual_cues", [])
-        if video_type == "informative":
-            analysis["key_insights"] = take_screenshots(
-                args.url, analysis.get("key_insights", []), out_dir, max_shots,
-                visual_cues=visual_cues,
-            )
-            already   = sum(1 for i in analysis["key_insights"] if "screenshot" in i)
-            remaining = max(0, max_shots - already)
-            if remaining:
-                analysis["key_topics"] = take_screenshots(
-                    args.url, analysis.get("key_topics", []), out_dir, remaining,
+        transcript_file = out_dir / "transcript.txt"
+        metadata_file   = out_dir / "metadata.json"
+        analysis_file   = out_dir / "analysis.json"
+
+        # ── 2. Transcript ────────────────────────────────────────────
+        with tracer.span(run_trace, "transcript_fetch") as step_span:
+            if transcript_file.exists():
+                print("\n[2/7] Transcript cached — loading from file ...")
+                timestamped_text = transcript_file.read_text(encoding="utf-8")
+                plain_text = " ".join(
+                    line.split("] ", 1)[1]
+                    for line in timestamped_text.splitlines()
+                    if "] " in line
                 )
-        else:
-            analysis["qa_pairs"] = take_screenshots(
-                args.url, analysis.get("qa_pairs", []), out_dir, max_shots,
-                visual_cues=visual_cues,
-            )
-            already   = sum(1 for q in analysis["qa_pairs"] if "screenshot" in q)
-            remaining = max(0, max_shots - already)
-            if remaining:
-                analysis["key_insights"] = take_screenshots(
-                    args.url, analysis.get("key_insights", []), out_dir, remaining,
+                cached_meta = json.loads(metadata_file.read_text(encoding="utf-8")) if metadata_file.exists() else {}
+                lang = cached_meta.get("lang", "en")
+                print(f"      {len(timestamped_text):,} chars  |  lang: {lang}")
+            else:
+                print("\n[2/7] Fetching transcript ...")
+                segments, lang = fetch_transcript(video_id)
+                plain_text       = " ".join((s.text if hasattr(s, "text") else s["text"]) for s in segments)
+                timestamped_text = segments_to_timestamped_text(segments)
+                print(f"      Language: {lang}  |  Segments: {len(segments)}  |  "
+                      f"Chars: {len(plain_text):,}")
+                transcript_file.write_text(timestamped_text, encoding="utf-8")
+                print(f"      transcript.txt saved")
+                metadata_file.write_text(
+                    json.dumps({**metadata, "lang": lang, "url": args.url}, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
                 )
+            step_span.update(output={"language": lang, "chars": len(plain_text)})
 
-    # ── 7. Word cloud ────────────────────────────────────────────
-    wc_path = out_dir / "wordcloud.png"
-    if wc_path.exists():
-        print(f"\n[7/7] Word cloud cached — skipping.")
-    else:
-        print("\n[7/7] Generating word cloud ...", end=" ", flush=True)
-        generate_wordcloud(plain_text, str(wc_path))
-        print(f"saved -> {wc_path}")
+        # ── 2.5. Sarvam translation (Hindi → English) ───────────────
+        translated_file = out_dir / "transcript_en.txt"
+        if lang in HINDI_LANG_CODES and not args.no_translate:
+            with tracer.span(run_trace, "sarvam_translation") as step_span:
+                if args.sarvam_key:
+                    if translated_file.exists():
+                        print("\n[2.5] Translation cached — loading transcript_en.txt ...")
+                        timestamped_text = translated_file.read_text(encoding="utf-8")
+                        print(f"      {len(timestamped_text):,} chars")
+                    else:
+                        n_chunks = max(1, (len(timestamped_text) + SARVAM_CHUNK_CHARS - 1) // SARVAM_CHUNK_CHARS)
+                        print(f"\n[2.5] Translating Hindi → English via Sarvam Mayura "
+                              f"({n_chunks} chunk(s)) ...")
+                        try:
+                            timestamped_text = translate_transcript_sarvam(timestamped_text, args.sarvam_key)
+                            translated_file.write_text(timestamped_text, encoding="utf-8")
+                            print(f"      transcript_en.txt saved ({len(timestamped_text):,} chars)")
+                        except Exception as exc:
+                            print(f"      WARN: Translation failed ({exc}) — using original Hindi transcript")
+                    # Rebuild plain_text from the (now English) timestamped transcript
+                    plain_text = " ".join(
+                        line.split("] ", 1)[1]
+                        for line in timestamped_text.splitlines()
+                        if "] " in line
+                    )
+                    step_span.update(output={"chars": len(timestamped_text)})
+                else:
+                    print("\n[2.5] Hindi transcript detected — set SARVAM_API_KEY to enable translation.")
+                    step_span.update(output={"status": "skipped", "reason": "No Sarvam API key"})
 
-    # ── Report ───────────────────────────────────────────────────
-    report_file = out_dir / "report.md"
-    if report_file.exists():
-        print("      Report cached — skipping.")
-        report_path = str(report_file)
-    else:
-        print("      Generating Sangrahak report ...", end=" ", flush=True)
-        report_path = generate_sangrahak_report(
-            client, analysis, metadata, args.url, lang, video_type, out_dir, args.report_model,
-            report_instructions=report_instructions,
-        )
-        print(f"saved -> {report_path}")
+        # ── 4+5. Classify + Analyse ──────────────────────────────────
+        if analysis_file.exists():
+            print("\n[4/7] Classify skipped — analysis.json cached.")
+            print("\n[5/7] Analyse skipped — analysis.json cached.")
+            analysis   = json.loads(analysis_file.read_text(encoding="utf-8"))
+            video_type = analysis.get("video_type", "informative")
+            print(f"      -> {video_type.upper()} (from cache)")
+        else:
+            print("\n[4/7] Classifying video type ...")
+            with tracer.span(run_trace, "classify_video") as step_span:
+                client.bind_context(span_obj=step_span)
+                video_type = classify_video(client, metadata, timestamped_text, args.model)
+                client.bind_context(clear_span=True)
+                step_span.update(output={"video_type": video_type})
+            print(f"      -> {video_type.upper()}")
 
-    # ── Summary ──────────────────────────────────────────────────
-    print(f"\n{SEP}")
-    print("  DONE")
-    print(SEP)
-    print(f"\n  Output folder : {out_dir.resolve()}")
-    print( "  Files created :")
-    print( "    transcript.txt   -- raw transcript with [HH:MM:SS] timestamps")
-    print( "    analysis.json    -- structured JSON analysis")
-    print( "    wordcloud.png    -- word cloud image")
-    print( "    report.md        -- full markdown report")
-    if not args.no_screenshots:
-        shots_dir = out_dir / "screenshots"
-        if shots_dir.exists():
-            count = len(list(shots_dir.glob("*.jpg")))
-            print(f"    screenshots/     -- {count} screenshot(s)")
-    print()
+            print("\n[5/7] Analysing transcript ...")
+            with tracer.span(run_trace, "analyse_transcript") as step_span:
+                client.bind_context(span_obj=step_span)
+                if video_type == "informative":
+                    analysis = analyze_informative(client, timestamped_text, metadata, args.model, analyse_instructions)
+                    print(f"      Topics: {len(analysis.get('key_topics', []))}  |  "
+                          f"Insights: {len(analysis.get('key_insights', []))}")
+                else:
+                    analysis = analyze_interview(client, timestamped_text, metadata, args.model, analyse_instructions)
+                    print(f"      Q&A pairs: {len(analysis.get('qa_pairs', []))}  |  "
+                          f"Insights: {len(analysis.get('key_insights', []))}")
+                client.bind_context(clear_span=True)
+                step_span.update(output={"topics_or_qa_count": len(analysis.get('key_topics', analysis.get('qa_pairs', [])))})
+
+            analysis["video_type"] = video_type
+            analysis_file.write_text(
+                json.dumps(analysis, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+
+        # ── 6. Screenshots ───────────────────────────────────────────
+        shots_dir      = out_dir / "screenshots"
+        existing_shots = list(shots_dir.glob("*.jpg")) if shots_dir.exists() else []
+        if args.no_screenshots:
+            print("\n[6/7] Screenshots skipped (--no-screenshots).")
+        elif existing_shots:
+            print(f"\n[6/7] Screenshots cached — {len(existing_shots)} already exist, skipping.")
+        else:
+            print("\n[6/7] Taking screenshots at key timestamps ...")
+            with tracer.span(run_trace, "take_screenshots") as step_span:
+                max_shots   = args.max_screenshots
+                visual_cues = analysis.get("visual_cues", [])
+                if video_type == "informative":
+                    analysis["key_insights"] = take_screenshots(
+                        args.url, analysis.get("key_insights", []), out_dir, max_shots,
+                        visual_cues=visual_cues,
+                    )
+                    already   = sum(1 for i in analysis["key_insights"] if "screenshot" in i)
+                    remaining = max(0, max_shots - already)
+                    if remaining:
+                        analysis["key_topics"] = take_screenshots(
+                            args.url, analysis.get("key_topics", []), out_dir, remaining,
+                        )
+                else:
+                    analysis["qa_pairs"] = take_screenshots(
+                        args.url, analysis.get("qa_pairs", []), out_dir, max_shots,
+                        visual_cues=visual_cues,
+                    )
+                    already   = sum(1 for q in analysis["qa_pairs"] if "screenshot" in q)
+                    remaining = max(0, max_shots - already)
+                    if remaining:
+                        analysis["key_insights"] = take_screenshots(
+                            args.url, analysis.get("key_insights", []), out_dir, remaining,
+                        )
+                step_span.update(output={"status": "success"})
+
+        # ── 7. Word cloud ────────────────────────────────────────────
+        wc_path = out_dir / "wordcloud.png"
+        if wc_path.exists():
+            print(f"\n[7/7] Word cloud cached — skipping.")
+        else:
+            print("\n[7/7] Generating word cloud ...", end=" ", flush=True)
+            with tracer.span(run_trace, "generate_wordcloud"):
+                generate_wordcloud(plain_text, str(wc_path))
+            print(f"saved -> {wc_path}")
+
+        # ── Report ───────────────────────────────────────────────────
+        report_file = out_dir / "report.md"
+        if report_file.exists():
+            print("      Report cached — skipping.")
+            report_path = str(report_file)
+        else:
+            print("      Generating Sangrahak report ...", end=" ", flush=True)
+            with tracer.span(run_trace, "generate_report") as step_span:
+                client.bind_context(span_obj=step_span)
+                report_path = generate_sangrahak_report(
+                    client, analysis, metadata, args.url, lang, video_type, out_dir, args.report_model,
+                    report_instructions=report_instructions,
+                )
+                client.bind_context(clear_span=True)
+            print(f"saved -> {report_path}")
+
+        # ── OKF export ───────────────────────────────────────────────
+        okf_count = 0
+        if args.okf_bundle:
+            from okf_manager import init_bundle as _okf_init, export_youtube_to_okf as _okf_export
+            okf_path = Path(args.okf_bundle)
+            if not (okf_path / "index.md").exists():
+                _okf_init(okf_path)
+            meta_with_url = {**metadata, "url": args.url}
+            okf_count = _okf_export(analysis, meta_with_url, args.url, okf_path)
+            print(f"\n  OKF exported   : {okf_count} concept docs -> {okf_path.resolve()}")
+
+        # ── Summary ──────────────────────────────────────────────────
+        print(f"\n{SEP}")
+        print("  DONE")
+        print(SEP)
+        print(f"\n  Output folder : {out_dir.resolve()}")
+        print( "  Files created :")
+        print( "    transcript.txt   -- raw transcript with [HH:MM:SS] timestamps")
+        print( "    analysis.json    -- structured JSON analysis")
+        print( "    wordcloud.png    -- word cloud image")
+        print( "    report.md        -- full markdown report")
+        if not args.no_screenshots:
+            shots_dir = out_dir / "screenshots"
+            if shots_dir.exists():
+                count = len(list(shots_dir.glob("*.jpg")))
+                print(f"    screenshots/     -- {count} screenshot(s)")
+        if okf_count:
+            print(f"    OKF bundle       -- {okf_count} concept docs")
+        print()
 
 
 if __name__ == "__main__":
     main()
+
